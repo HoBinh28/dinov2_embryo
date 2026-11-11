@@ -9,14 +9,14 @@ import math
 import os
 from functools import partial
 
-from fvcore.common.checkpoint import PeriodicCheckpointer
+from fvcore.common.checkpoint import Checkpointer, PeriodicCheckpointer
 import torch
 from torchvision.datasets.vision import StandardTransform
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, CellAugmentationDINO, MaskingGenerator
 import dinov2.distributed as distributed
-from dinov2.fsdp import FSDPCheckpointer
+from dinov2.fsdp import FSDPCheckpointer, is_fsdp
 from dinov2.logging import MetricLogger
 from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
@@ -120,6 +120,14 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
 
+def clip_student_grads(model, max_norm):
+    for v in model.student.values():
+        if is_fsdp(v):
+            v.clip_grad_norm_(max_norm)
+        else:
+            torch.nn.utils.clip_grad_norm_(v.parameters(), max_norm)
+
+
 class _EmptyTarget:
     # picklable equivalent of `lambda _: ()` (safe with any DataLoader worker start method)
     def __call__(self, _):
@@ -145,7 +153,8 @@ def do_train(cfg, model, resume=False, dataset=None):
             `cfg.train.dataset_path`; its transforms are replaced by the DINO augmentations.
     """
     model.train()
-    inputs_dtype = torch.half
+    # FSDP casts params to fp16 itself; in single-GPU mode inputs stay fp32 and torch.autocast handles precision
+    inputs_dtype = torch.half if getattr(model, "use_fsdp", True) else torch.float32
     fp16_scaler = model.fp16_scaler  # for mixed precision training
 
     # setup optimizer
@@ -160,7 +169,10 @@ def do_train(cfg, model, resume=False, dataset=None):
     ) = build_schedulers(cfg)
 
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    if getattr(model, "use_fsdp", True):
+        checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    else:
+        checkpointer = Checkpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
 
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
@@ -277,14 +289,12 @@ def do_train(cfg, model, resume=False, dataset=None):
         if fp16_scaler is not None:
             if cfg.optim.clip_grad:
                 fp16_scaler.unscale_(optimizer)
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                clip_student_grads(model, cfg.optim.clip_grad)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
         else:
             if cfg.optim.clip_grad:
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
+                clip_student_grads(model, cfg.optim.clip_grad)
             optimizer.step()
 
         # perform teacher EMA update

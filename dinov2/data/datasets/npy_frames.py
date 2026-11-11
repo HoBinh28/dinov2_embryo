@@ -124,7 +124,7 @@ class NpyFramesDataset(VisionDataset):
         return frame
 
     def get_image(self, index: int) -> Image.Image:
-        return Image.fromarray(self.load_frame(index), mode="L").convert("RGB")
+        return Image.fromarray(self.load_frame(index)).convert("RGB")  # 2D uint8 -> "L" -> RGB
 
     def get_target(self, index: int) -> int:
         return 0  # unlabeled

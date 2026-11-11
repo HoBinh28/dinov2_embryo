@@ -3,6 +3,7 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from functools import partial
 import logging
 
@@ -19,10 +20,18 @@ from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, r
 from dinov2.models.vision_transformer import BlockChunk
 
 
-try:
-    from xformers.ops import fmha
-except ImportError:
-    raise AssertionError("xFormers is required for training")
+def _cat_tokens(tensor_list):
+    # Concatenate (1, n_i, D) tensors along dim 1; the heads are applied per token, so this is
+    # equivalent to xFormers' BlockDiagonalMask.from_tensor_list (pure PyTorch, no xFormers needed).
+    sizes = [t.shape[1] for t in tensor_list]
+    return torch.cat(tensor_list, dim=1), sizes
+
+
+def _split_tokens(x, sizes):
+    return list(torch.split(x, sizes, dim=1))
+
+
+_AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 logger = logging.getLogger("dinov2")
@@ -32,7 +41,22 @@ class SSLMetaArch(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
+        # use_fsdp=False: plain single-GPU training (no FSDP / NCCL), mixed precision via torch.autocast
+        self.use_fsdp = bool(cfg.train.get("use_fsdp", True))
+        if self.use_fsdp:
+            if ShardedGradScaler is None:
+                raise RuntimeError("ShardedGradScaler unavailable in this torch version; set train.use_fsdp=false")
+            self.amp_dtype = None
+            self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
+        else:
+            amp = str(cfg.compute_precision.get("amp_dtype", "bf16"))
+            if amp not in _AMP_DTYPES:
+                raise ValueError(f"compute_precision.amp_dtype must be one of {list(_AMP_DTYPES)}, got {amp}")
+            self.amp_dtype = _AMP_DTYPES[amp]
+            # bf16 has the fp32 exponent range: no loss scaling needed
+            use_scaler = self.amp_dtype == torch.float16 and cfg.compute_precision.grad_scaler
+            self.fp16_scaler = torch.amp.GradScaler("cuda") if use_scaler else None
+        logger.info(f"OPTIONS -- use_fsdp: {self.use_fsdp}, amp_dtype: {self.amp_dtype}")
 
         student_model_dict = dict()
         teacher_model_dict = dict()
@@ -129,7 +153,19 @@ class SSLMetaArch(nn.Module):
         else:
             loss.backward()
 
+    def autocast(self):
+        if self.amp_dtype is None:  # FSDP handles mixed precision itself
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=self.amp_dtype)
+
     def forward_backward(self, images, teacher_temp):
+        with self.autocast():
+            loss_dict, loss_accumulator = self.compute_losses(images, teacher_temp)
+        self.backprop_loss(loss_accumulator)
+        self.fsdp_synchronize_streams()
+        return loss_dict
+
+    def compute_losses(self, images, teacher_temp):
         n_global_crops = 2
         assert n_global_crops == 2
         n_local_crops = self.cfg.crops.local_crops_number
@@ -262,8 +298,8 @@ class SSLMetaArch(nn.Module):
                 ]
 
         # 2: run
-        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
-        outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
+        cat_inputs, split_sizes = _cat_tokens(inputs_for_student_head_list)
+        outputs_list = _split_tokens(self.student.dino_head(cat_inputs), split_sizes)
 
         # 3a: local crops cls tokens
         student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
@@ -339,14 +375,10 @@ class SSLMetaArch(nn.Module):
             # accumulate loss
             loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
-        self.backprop_loss(loss_accumulator)
-
-        self.fsdp_synchronize_streams()
-
-        return loss_dict
+        return loss_dict, loss_accumulator
 
     def fsdp_synchronize_streams(self):
-        if self.need_to_synchronize_fsdp_streams:
+        if self.use_fsdp and self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
             self.student.dino_head._streams = (
                 self.teacher.dino_head._streams
@@ -358,9 +390,16 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
-                for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
-                    student_param_list += ms.params
-                    teacher_param_list += mt.params
+                if self.use_fsdp:
+                    for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
+                        student_param_list += ms.params
+                        teacher_param_list += mt.params
+                else:
+                    s_params = list(self.student[k].parameters())
+                    t_params = list(self.teacher[k].parameters())
+                    assert len(s_params) == len(t_params)
+                    student_param_list += s_params
+                    teacher_param_list += t_params
             torch._foreach_mul_(teacher_param_list, m)
             torch._foreach_add_(teacher_param_list, student_param_list, alpha=1 - m)
 
@@ -392,6 +431,11 @@ class SSLMetaArch(nn.Module):
         if has_batchnorms(self.student):
             raise NotImplementedError
         # below will synchronize all student subnetworks across gpus:
+        if not self.use_fsdp:
+            logger.info("single-GPU mode -- no FSDP wrapping, teacher initialized from student")
+            for k in self.student.keys():
+                self.teacher[k].load_state_dict(self.student[k].state_dict())
+            return
         for k, v in self.student.items():
             self.teacher[k].load_state_dict(self.student[k].state_dict())
             student_model_cfg = self.cfg.compute_precision.student[k]

@@ -40,17 +40,22 @@ def make_cfg(overrides: Dict[str, Any], output_dir: str) -> DictConfig:
 
 def setup_single_gpu(cfg: DictConfig, seed: int = 0) -> DictConfig:
     """
-    Notebook equivalent of `dinov2.utils.config.setup`: creates the output dir, starts a
-    1-process NCCL group (FSDP needs it, even with one GPU), sets up logging/seed,
-    applies the lr scaling rule and saves config.yaml. Safe to call again after a cell re-run.
+    Notebook equivalent of `dinov2.utils.config.setup`: creates the output dir, sets up
+    logging/seed, applies the lr scaling rule and saves config.yaml.
+    With train.use_fsdp=true it also starts a 1-process NCCL group (FSDP needs one);
+    with train.use_fsdp=false (recommended on 1 GPU / recent torch) no process group is created.
+    Safe to call again after a cell re-run.
     """
     global _LOGGING_READY
     os.makedirs(cfg.train.output_dir, exist_ok=True)
 
-    if not distributed.is_enabled():
-        distributed.enable(overwrite=True)
-    if distributed.get_global_size() != 1:
-        logger.warning(f"expected 1 process, got world size {distributed.get_global_size()}")
+    if cfg.train.get("use_fsdp", True):
+        if not distributed.is_enabled():
+            distributed.enable(overwrite=True)
+        if distributed.get_global_size() != 1:
+            logger.warning(f"expected 1 process, got world size {distributed.get_global_size()}")
+    else:
+        torch.cuda.set_device(0)
 
     if not _LOGGING_READY:
         setup_logging(output=cfg.train.output_dir, level=logging.INFO)

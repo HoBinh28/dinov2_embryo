@@ -14,9 +14,18 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp import StateDictType
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-from torch.distributed.fsdp._runtime_utils import _reshard
+
+try:
+    from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+except ImportError:  # moved/removed in some torch versions; only needed for multi-GPU FSDP training
+    ShardedGradScaler = None
+
+try:
+    # private torch 2.0 API used by the multi-GPU FSDP path only (the single-GPU path does not need it)
+    from torch.distributed.fsdp._runtime_utils import _reshard
+except ImportError:
+    _reshard = None
 
 
 def get_fsdp_wrapper(model_cfg, modules_to_wrap=set()):
@@ -64,6 +73,11 @@ def is_sharded_fsdp(x):
 
 def free_if_fsdp(x):
     if is_sharded_fsdp(x):
+        if _reshard is None or not hasattr(x, "_handles"):
+            raise RuntimeError(
+                "Multi-GPU FSDP training in this repo requires torch 2.0 internals; "
+                "use the single-GPU mode (train.use_fsdp=false) with newer torch versions"
+            )
         handles = x._handles
         true_list = [True for h in handles]
         _reshard(x, handles, true_list)

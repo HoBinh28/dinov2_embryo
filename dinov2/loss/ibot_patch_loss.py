@@ -3,6 +3,8 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -15,6 +17,8 @@ logger = logging.getLogger("dinov2")
 
 
 try:
+    if os.environ.get("XFORMERS_DISABLED") is not None:
+        raise ImportError
     from xformers.ops import cross_entropy
 
     def lossfunc(t, s, temp):
@@ -65,7 +69,8 @@ class iBOTPatchLoss(nn.Module):
         Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
         # B = Q.shape[1] * world_size # number of samples to assign
         B = n_masked_patches_tensor
-        dist.all_reduce(B)
+        if dist.is_initialized():
+            dist.all_reduce(B)
         K = Q.shape[0]  # how many prototypes
 
         # make the matrix sums to 1
