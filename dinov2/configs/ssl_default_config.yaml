@@ -2,6 +2,7 @@ MODEL:
   WEIGHTS: ''
 compute_precision:
   grad_scaler: true
+  amp_dtype: bf16  # single-GPU mode only (train.use_fsdp=false): bf16 | fp16
   teacher:
     backbone:
       sharding_strategy: SHARD_GRAD_OP
@@ -69,6 +70,8 @@ train:
   cache_dataset: true
   centering: "centering" # or "sinkhorn_knopp"
   cell_augmentation: false
+  augmentation: dino  # "dino" (default DINOv2) or "embryo" (see augmentation_embryo below)
+  use_fsdp: true  # false: single-GPU training without FSDP / NCCL (mixed precision via torch.autocast)
 student:
   arch: vit_large
   patch_size: 16
@@ -121,3 +124,20 @@ crops:
   local_crops_size: 96
 evaluation:
   eval_period_iterations: 12500
+# used when train.augmentation == "embryo" (dinov2/data/augmentations_embryo.py)
+augmentation_embryo:
+  hflip_p: 0.5
+  vflip_p: 0.5
+  rot90: true
+  rotation_degrees: 0.0
+  rotation_fill: 0
+  color_jitter_p: 0.8
+  brightness: 0.4
+  contrast: 0.4
+  blur_sigma: [0.1, 1.0]
+  blur_kernel_size: 9
+  blur_p_global1: 0.5
+  blur_p_global2: 0.2
+  blur_p_local: 0.3
+  solarize_p_global2: 0.0
+  solarize_threshold: 128

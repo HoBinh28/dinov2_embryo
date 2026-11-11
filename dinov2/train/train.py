@@ -15,6 +15,8 @@ from torchvision.datasets.vision import StandardTransform
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, CellAugmentationDINO, MaskingGenerator
+from dinov2.data import DataAugmentationEmbryo
+from omegaconf import OmegaConf
 import dinov2.distributed as distributed
 from dinov2.fsdp import FSDPCheckpointer, is_fsdp
 from dinov2.logging import MetricLogger
@@ -203,6 +205,15 @@ def do_train(cfg, model, resume=False, dataset=None):
             cfg.crops.local_crops_number,
             global_crops_size=cfg.crops.global_crops_size,
             local_crops_size=cfg.crops.local_crops_size,
+        )
+    elif cfg.train.get("augmentation", "dino") == "embryo":
+        data_transform = DataAugmentationEmbryo(
+            cfg.crops.global_crops_scale,
+            cfg.crops.local_crops_scale,
+            cfg.crops.local_crops_number,
+            global_crops_size=cfg.crops.global_crops_size,
+            local_crops_size=cfg.crops.local_crops_size,
+            **OmegaConf.to_container(cfg.augmentation_embryo, resolve=True),
         )
     else:
         data_transform = DataAugmentationDINO(
