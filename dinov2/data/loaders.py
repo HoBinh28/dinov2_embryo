@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ImageNet, ImageNet22k, HPAone, HPAFoV, CHAMMI_CP, CHAMMI_HPA, CHAMMI_WTC
+from .datasets import ImageNet, ImageNet22k, HPAone, HPAFoV, CHAMMI_CP, CHAMMI_HPA, CHAMMI_WTC, CustomImageFolder, NpyFramesDataset
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 
@@ -47,8 +47,16 @@ def _parse_dataset_str(dataset_str: str):
     name = tokens[0]
     kwargs = {}
 
+    # Re-join tokens split inside a value, e.g. Windows drive letters ("root=D:/data").
+    merged_tokens = []
     for token in tokens[1:]:
-        key, value = token.split("=")
+        if "=" not in token and merged_tokens:
+            merged_tokens[-1] += ":" + token
+        else:
+            merged_tokens.append(token)
+
+    for token in merged_tokens:
+        key, value = token.split("=", 1)
         assert key in ("root", "extra", "split", "mode", "wildcard")
         kwargs[key] = value
 
@@ -68,6 +76,11 @@ def _parse_dataset_str(dataset_str: str):
         class_ = CHAMMI_WTC
     elif name == "CHAMMI_HPA":
         class_ = CHAMMI_HPA
+    elif name == "CustomImageFolder":
+        class_ = CustomImageFolder
+    elif name == "NpyFrames":
+        # NpyFrames:root=<list.json>[:split=<key>][:extra=<data_root prefix>]
+        class_ = NpyFramesDataset
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 

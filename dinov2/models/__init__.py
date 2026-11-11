@@ -42,4 +42,7 @@ def build_model(args, only_teacher=False, img_size=224):
 
 
 def build_model_from_cfg(cfg, only_teacher=False):
-    return build_model(cfg.student, only_teacher=only_teacher, img_size=cfg.crops.global_crops_size)
+    # `student.img_size` (optional) sets the size the positional embedding is built for,
+    # e.g. 518 to match the official DINOv2 checkpoints; inputs of other sizes are interpolated.
+    img_size = cfg.student.get("img_size", None) or cfg.crops.global_crops_size
+    return build_model(cfg.student, only_teacher=only_teacher, img_size=img_size)

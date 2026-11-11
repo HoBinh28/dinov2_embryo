@@ -11,6 +11,7 @@ from functools import partial
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
 import torch
+from torchvision.datasets.vision import StandardTransform
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
 from dinov2.data import collate_data_and_cast, DataAugmentationDINO, CellAugmentationDINO, MaskingGenerator
@@ -119,6 +120,12 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
         param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
 
 
+class _EmptyTarget:
+    # picklable equivalent of `lambda _: ()` (safe with any DataLoader worker start method)
+    def __call__(self, _):
+        return ()
+
+
 def do_test(cfg, model, iteration):
     new_state_dict = model.teacher.state_dict()
 
@@ -131,7 +138,12 @@ def do_test(cfg, model, iteration):
         torch.save({"teacher": new_state_dict}, teacher_ckp_path)
 
 
-def do_train(cfg, model, resume=False):
+def do_train(cfg, model, resume=False, dataset=None):
+    """
+    Args:
+        dataset: optional pre-built dataset (e.g. from a notebook). If given, it is used instead of
+            `cfg.train.dataset_path`; its transforms are replaced by the DINO augmentations.
+    """
     model.train()
     inputs_dtype = torch.half
     fp16_scaler = model.fp16_scaler  # for mixed precision training
@@ -200,11 +212,18 @@ def do_train(cfg, model, resume=False):
 
     # setup data loader
 
-    dataset = make_dataset(
-        dataset_str=cfg.train.dataset_path,
-        transform=data_transform,
-        target_transform=lambda _: (),
-    )
+    if dataset is None:
+        dataset = make_dataset(
+            dataset_str=cfg.train.dataset_path,
+            transform=data_transform,
+            target_transform=lambda _: (),
+        )
+    else:
+        target_transform = _EmptyTarget()
+        dataset.transform = data_transform
+        dataset.target_transform = target_transform
+        dataset.transforms = StandardTransform(data_transform, target_transform)
+        logger.info(f"using pre-built dataset {type(dataset).__name__} with {len(dataset):,d} samples")
     # sampler_type = SamplerType.INFINITE
     sampler_type = SamplerType.SHARDED_INFINITE
     data_loader = make_data_loader(
